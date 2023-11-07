@@ -134,7 +134,7 @@ holding cryptographic signatures and related metadata:
 </details>
 
 - The `m.room.member` event should have the following new content
-  fields when the membership state is `invite` or `join`, *unless* it
+  fields when the membership state is `invite`, `join`, `leave`, or `ban`, *unless* it
   is an `invite` event created by the homeserver as a successor of an
   `m.room.third_party_invite` event:
   + `sender_key`: The sender's public Room Signing Key, signed by
