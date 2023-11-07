@@ -71,6 +71,14 @@ by the string `m.cross_signing.room_signing`, and will be published to
 the `/keys/device_signing/upload` endpoint using the new optional
 field `room_signing_key`, with usage `["room_signing"]`.
 
+It should be noted however there is one case where the RSK is not required
+to verify a membership event. On room creation, the server is responsible
+for creating `m.room.member` events for the room creator and potentially
+invites to the initial user list. To handle such case, we instead confirm
+validation of the parent event (`m.room.create`), and ensure the user IDs
+and MSKs that are joining or invited exist in the creation event's signed
+content.
+
 The proposal also adds additional fields to several room state events,
 holding cryptographic signatures and related metadata:
 
@@ -82,6 +90,10 @@ holding cryptographic signatures and related metadata:
     signature tree.
   + `creator_key`: The public part of the room creator's Master
     Signing Key.
+  + `invited_user_keys`: An optional field containing the MSKs of the users
+    that are invited on room creation. This field is required if the `invite`
+    field is populated in the `createRoom` request. This field contains a
+    mapping of user IDs to MSKs for each user.
   + `signatures`: A signature of the event's `content` by the Room
     Root Key, generated using the normal process for signing JSON
     objects. For this purpose, the entity performing the signature is
@@ -132,18 +144,26 @@ holding cryptographic signatures and related metadata:
     This field is provided in order to simplify the process of
     connecting the sender's MSK to their RSK, particularly in cases
     where the sender may no longer be in the room or may have even
-    deactivated their account.
+    deactivated their account. This field may be omitted if event was created
+    by the homeserver on room creation.
   + `parent_event_id`:
       * If this is an `invite` event sent directly by a user, the
-        parent event is the inviter's cause-of-membership event.
+        parent event is the inviter's cause-of-membership event. If the event
+        was sent by the homeserver, the parent event is the `m.room.create`
+        event.
       * If this is a `join` event, the parent event is the `invite`
-        event or `m.room.join_rules` event that allowed this user to
-        join.
+        event, `m.room.create` event in the case where the event is generated
+        by the homeserver, or `m.room.join_rules` event that allowed this user
+        to join.
+      * If this is a `leave` or `ban` event, the parent event is the
+        `join` event of the sender
   + `user_key`: The public MSK of the user whose membership is being
     affected.
   + `room_root_key`: The public RRK.
   + `signatures`: A signature of this event's content by the sender's
-    RSK, generated using the normal process for signing JSON objects.
+    RSK, generated using the normal process for signing JSON objects. This
+    field may be omitted if event was created by the homeserver on room
+    creation.
   + `unsigned`: If this is a `join` event for a restricted room based
     on membership in another room, and that other room has an RRK,
     then the unsigned data must include the following field:
@@ -178,8 +198,11 @@ holding cryptographic signatures and related metadata:
     connecting the sender's MSK to their RSK, particularly in cases
     where the sender may no longer be in the room or may have even
     deactivated their account.
+  + `user_key`: The public part of the sender's MSK. Optional field,
+    unless this event is created via a `m.room.tombstone` event.
   + `parent_event_id`: The ID of the sender's cause-of-membership
-    event.
+    event. Required field, unless this event is created via a
+    `m.room.tombstone` event, in which case it must be omitted.
   + `signatures`: A signature of this event by the sender's RSK,
     generated using the normal process for signing JSON objects.
 
@@ -211,11 +234,11 @@ the homeserver generate the events from scratch:
   additional content fields except for data under `unsigned`. If the
   event content provided is unacceptable for any reason, the server
   should reject the request with a suitable error.
-  
+
 - The body of a `/rooms/{roomId}/invite` request or of a `/join`
   request will now hold all signed content fields of the
   `m.room.member` event or `m.room.third_party_invite` event.
-  
+
 For third-party invitations in particular, the client must now be the
 one to communicate directly with the identity server and receive an
 MXID to invite directly, or a token to publish in the
@@ -233,24 +256,39 @@ flowchart TD
 
     start ==>|<code>join</code> event|join_rrk{"Does the event<br/>contain the correct RRK<br/>and the user's MSK?"}
     join_rrk -->|No|reject
-    join_rrk ==>|Yes|join_sig{"Does the event<br/>have a valid signature<br/>by the user's RSK?"}
+    join_rrk ==>|Yes|join_sig_exists{"Does the event have<br/>a signature and RSK?"}
+    join_sig_exists ==>|No|is_room_creator["Look up the event's<br/>parent event ID"]
+    is_room_creator ==>|Yes|creator_event_valid{"Does the parent event<br/>pass verification?"}
+    creator_event_valid -->|No|reject
+    creator_event_valid ==>|Yes|creator_event_match{"Is the parent event a<br/><code>m.room.create</code> event and<br/>does the sender's user id + user<br/>MSK match what is contained in<br/>the parent event?"}
+    creator_event_match -->|No|reject
+    creator_event_match ==>|Yes|accept
+    join_sig_exists ==>|Yes|join_sig{"Does the event<br/>have a valid signature<br/>by the user's RSK?"}
     join_sig -->|No|reject
     join_sig ==>|Yes|join_rsk_msk{"Does the user's RSK<br/>have a valid signature<br/>by their MSK?"}
     join_rsk_msk -->|No|reject
     join_rsk_msk ==>|Yes|why_join{{"Look up<br/>the <code>join</code> event's<br/>parent event ID"}}
 
     why_join ==>|<code>invite</code> event|invite_kind{{"How was<br/>the <code>invite</code> event<br/>created?"}}
-    invite_kind ==>|Sent directly<br/>by a user|invite_rrk{"Does the event<br/>contain the correct RRK<br/>and the user's MSK?"}
+    invite_kind ==>|Sent directly by a<br/>user or homeserver|invite_rrk{"Does the event<br/>contain the correct RRK<br/>and the user's MSK?"}
     invite_rrk ---->|No|reject
-    invite_rrk =====>|Yes|check_sender{"Does the event<br/>have a valid signature<br/>by the sender's RSK?"}
+    invite_rrk =====>|Yes|invite_sig_exists{"Does the event have<br/>a signature and RSK?"}
+    invite_sig_exists ==>|No|is_room_creator
+    invite_sig_exists ==>|Yes|check_sender{"Does the event<br/>have a valid signature<br/>by the sender's RSK?"}
     check_sender -->|No|reject
     check_sender ==>|Yes|sender_rsk_msk{"Does the sender's RSK<br/>have a valid signature<br/>by their MSK?"}
     sender_rsk_msk ---->|No|reject
-    sender_rsk_msk ==>|Yes|lookup_sender_cause["Lookup this event's<br/>parent event ID -<br/>i.e., the sender's<br/>cause-of-membership event"]
+    sender_rsk_msk ==>|Yes|join_rule_parent_event{"Is the event a `m.room.join_rules`<br/>event and does it contain a<br/><code>parent_event_id</code> field?"}
+    join_rule_parent_event ==>|No|lookup_sender_cause["Lookup this event's<br/>parent event ID -<br/>i.e., the sender's<br/>cause-of-membership event"]
+    join_rule_parent_event ==>|Yes|join_rule_sender_msk{"Does the join rule<br/>sender MSK match that of<br/>the room creator?"}
+    join_rule_sender_msk ==>|No|reject
+    join_rule_sender_msk ==>|Yes|accept
     lookup_sender_cause==>sender_recurse{"Does the sender's<br/>cause-of-membership event<br/>pass verification?"}
     sender_recurse -.-> start
     sender_recurse -->|No|reject
-    sender_recurse =====>|Yes|accept
+    sender_recurse ==>check_sender_msk{"Does the sender's MSK<br/>match the MSK in the sender's<br/>cause-of-membership event?"}
+    check_sender_msk -->|No|reject
+    check_sender_msk =====>|Yes|accept
     invite_kind ==>|Created by the homeserver<br/>as a successor of an<br/><code>m.room.third_party_invite</code> event|idserver_sig{"Does the signed<br/>third-party-invite data<br/>have a valid signature<br/>from an identity server?"}
     idserver_sig -->|No|reject
     idserver_sig ==>|Yes|threepid_signed_msk{"Does the signed data<br/>contain the user's MSK?"}
@@ -334,6 +372,41 @@ invited, we make the following additional changes:
   from these URIs is thus as strong as the authenticity of whatever
   communications channel the URIs were sent through, which is again a
   fundamental limit.
+
+Additionally to protect from room version downgrade attacks (which do not
+verify state event signatures), we also add the following content fields
+to the `m.room.tombstone`:
++ `sender_key`: The sender's public Room Signing Key, signed by
+  their Master Signing Key, in the same `CrossSigningKey` format
+  used by the [`/keys/device_signing/upload`
+  endpoint](https://spec.matrix.org/v1.3/client-server-api/#post_matrixclientv3keysdevice_signingupload).
+  This field is provided in order to simplify the process of
+  connecting the sender's MSK to their RSK, particularly in cases
+  where the sender may no longer be in the room or may have even
+  deactivated their account.
++ `creation_content`: Identical to the content in the `m.room.create` event
+  (in addition to the added fields). The following differences should be noted
+  however:
+    * `room_root_key`: RRK of the new room to be created.
+    * `creator_key`: The sender's MSK should be used instead of the original
+      creator (in the case if the public keys are different)
+    * `invited_user_keys`: Tombstone upgrades do not transfer room membership
+      events to the new room. However the client will have the option to send
+      invites of all existing users in the old room to the new room if desired.
+    * `signatures`: The signature is of the `creation_content` field only by
+      the new RRK
++ `join_rules_content`: Identical to the content in `m.room.join_rules` event
+  (in addition to the added fields). As mentioned in `m.room.join_rules`
+  content's `parent_event_id` field, it must be omitted and verification is
+  done by the MSK.
++ `parent_event_id`: The ID of the sender's cause-of-membership event.
++ `signatures`: A signature of this event's content by the sender's
+    RSK, generated using the normal process for signing JSON objects.
+
+Similar checks are performed as in `m.space.child`:
++ Ensure event has a valid signature by the RSK.
++ Ensure the RSK has a valid signature by the sender's MSK.
++ Ensure sender's cause-of-membership event passes validation.
 
 ## Potential issues
 
